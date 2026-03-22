@@ -6,7 +6,7 @@ use crate::drives::{get_removable_drives, DriveInfo};
 use crate::eject::eject_drive;
 use crate::extract::{extract_7z_with_progress, ExtractProgress};
 use crate::format::{format_drive_fat32, FormatProgress};
-use crate::github::{download_asset, find_release_asset, get_latest_release, DownloadProgress};
+use crate::github::{download_asset, find_release_assets, get_latest_release, Asset, DownloadProgress};
 use eframe::egui;
 use egui_thematic::{ThemeConfig, ThemeEditorState, render_theme_panel};
 use std::path::PathBuf;
@@ -20,6 +20,7 @@ enum AppState {
     Idle,
     AwaitingConfirmation,
     FetchingRelease,
+    SelectingAsset,
     Downloading,
     Formatting,
     Extracting,
@@ -55,6 +56,11 @@ pub struct InstallerApp {
 
     // Drive that was installed to (for eject)
     installed_drive: Option<DriveInfo>,
+
+    // Asset selection (when multiple zip files in release)
+    available_assets: Arc<Mutex<Vec<Asset>>>,
+    selected_asset_idx: usize,
+    pending_release_tag: Arc<Mutex<String>>,
 
     // Cancellation token for aborting installation
     cancel_token: Option<CancellationToken>,
@@ -168,6 +174,9 @@ impl InstallerApp {
             })),
             log_messages: Arc::new(Mutex::new(Vec::new())),
             installed_drive: None,
+            available_assets: Arc::new(Mutex::new(Vec::new())),
+            selected_asset_idx: 0,
+            pending_release_tag: Arc::new(Mutex::new(String::new())),
             cancel_token: None,
             drive_rx: rx,
             drive_poll_tx: poll_tx,
@@ -230,7 +239,7 @@ impl InstallerApp {
         }
     }
 
-    fn start_installation(&mut self, ctx: egui::Context) {
+    fn fetch_release(&mut self, ctx: egui::Context) {
         let Some(drive_idx) = self.selected_drive_idx else {
             self.log("No drive selected");
             return;
@@ -284,6 +293,86 @@ impl InstallerApp {
         let progress = self.progress.clone();
         let log_messages = self.log_messages.clone();
         let ctx_clone = ctx.clone();
+        let available_assets = self.available_assets.clone();
+        let pending_release_tag = self.pending_release_tag.clone();
+
+        self.runtime.spawn(async move {
+            let log = |msg: &str| {
+                if let Ok(mut logs) = log_messages.lock() {
+                    logs.push(msg.to_string());
+                }
+                crate::debug::log(msg);
+                ctx_clone.request_repaint();
+            };
+
+            let set_progress = |current: u64, total: u64, message: &str| {
+                if let Ok(mut p) = progress.lock() {
+                    p.current = current;
+                    p.total = total;
+                    p.message = message.to_string();
+                }
+                ctx_clone.request_repaint();
+            };
+
+            log("Fetching latest release from GitHub...");
+            crate::debug::log_section("Fetching Release");
+            crate::debug::log(&format!("Repository URL: {}", repo_url));
+            set_progress(0, 100, "Fetching release info...");
+
+            let release = match get_latest_release(&repo_url).await {
+                Ok(r) => r,
+                Err(e) => {
+                    log(&format!("Error: {}", e));
+                    crate::debug::log(&format!("ERROR fetching release: {}", e));
+                    set_progress(0, 100, "ERROR");
+                    return;
+                }
+            };
+
+            let assets = find_release_assets(&release);
+            if assets.is_empty() {
+                log(&format!("Error: No {} file found in release", ASSET_EXTENSION));
+                crate::debug::log(&format!("ERROR: No {} asset found in release", ASSET_EXTENSION));
+                set_progress(0, 100, "ERROR");
+                return;
+            }
+
+            crate::debug::log(&format!("Release: {}", release.tag_name));
+            for a in &assets {
+                crate::debug::log(&format!("Asset: {} ({} bytes)", a.name, a.size));
+            }
+
+            if let Ok(mut tag) = pending_release_tag.lock() {
+                *tag = release.tag_name.clone();
+            }
+            if let Ok(mut av) = available_assets.lock() {
+                *av = assets;
+            }
+
+            set_progress(0, 100, "SELECTING_ASSET");
+        });
+    }
+
+    fn start_installation(&mut self, asset: Asset, ctx: egui::Context) {
+        let Some(drive) = self.installed_drive.clone() else {
+            self.log("No drive stored for installation");
+            return;
+        };
+
+        let release_tag = self.pending_release_tag.lock()
+            .map(|t| t.clone())
+            .unwrap_or_default();
+
+        self.log(&format!(
+            "Found release: {} ({})",
+            release_tag, asset.name
+        ));
+
+        self.state = AppState::Formatting;
+
+        let progress = self.progress.clone();
+        let log_messages = self.log_messages.clone();
+        let ctx_clone = ctx.clone();
         let volume_label = VOLUME_LABEL.to_string();
 
         // Create cancellation token
@@ -320,41 +409,6 @@ impl InstallerApp {
                 }
                 ctx_clone.request_repaint();
             };
-
-            // Step 1: Fetch release
-            log("Fetching latest release from GitHub...");
-            crate::debug::log_section("Fetching Release");
-            crate::debug::log(&format!("Repository URL: {}", repo_url));
-            set_progress(0, 100, "Fetching release info...");
-
-            let release = match get_latest_release(&repo_url).await {
-                Ok(r) => r,
-                Err(e) => {
-                    log(&format!("Error: {}", e));
-                    crate::debug::log(&format!("ERROR fetching release: {}", e));
-                    let _ = state_tx_clone.send(AppState::Error);
-                    let _ = drive_poll_tx_clone.send(true);
-                    return;
-                }
-            };
-
-            let asset = match find_release_asset(&release) {
-                Some(a) => a,
-                None => {
-                    log(&format!("Error: No {} file found in release", ASSET_EXTENSION));
-                    crate::debug::log(&format!("ERROR: No {} asset found in release", ASSET_EXTENSION));
-                    let _ = state_tx_clone.send(AppState::Error);
-                    let _ = drive_poll_tx_clone.send(true);
-                    return;
-                }
-            };
-
-            log(&format!(
-                "Found release: {} ({})",
-                release.tag_name, asset.name
-            ));
-            crate::debug::log(&format!("Release: {}", release.tag_name));
-            crate::debug::log(&format!("Asset: {} ({} bytes)", asset.name, asset.size));
 
             // Define temp/cache directory for later use
             // On Linux/macOS, use cache dir to avoid temp space issues
@@ -967,6 +1021,7 @@ impl eframe::App for InstallerApp {
         let show_modal = matches!(
             self.state,
             AppState::AwaitingConfirmation
+                | AppState::SelectingAsset
                 | AppState::Complete
                 | AppState::Ejecting
                 | AppState::Ejected
@@ -1011,8 +1066,20 @@ impl eframe::App for InstallerApp {
         }
 
         // Check for state updates from main installation process
+        let mut auto_start_asset: Option<Asset> = None;
         if let Ok(mut progress) = self.progress.lock() {
-            if progress.message == "COMPLETE" {
+            if progress.message == "SELECTING_ASSET" {
+                progress.message.clear();
+                let assets = self.available_assets.lock()
+                    .map(|a| a.clone())
+                    .unwrap_or_default();
+                if assets.len() == 1 {
+                    auto_start_asset = assets.into_iter().next();
+                } else {
+                    self.selected_asset_idx = 0;
+                    self.state = AppState::SelectingAsset;
+                }
+            } else if progress.message == "COMPLETE" {
                 self.state = AppState::Complete;
                 self.cancel_token = None;
                 progress.message.clear();
@@ -1045,6 +1112,10 @@ impl eframe::App for InstallerApp {
             }
         }
 
+        // Auto-start installation if single asset was found (deferred to avoid borrow conflict)
+        if let Some(asset) = auto_start_asset {
+            self.start_installation(asset, ctx.clone());
+        }
 
         // Keep requesting repaints while busy so UI stays responsive
         let is_busy = matches!(
@@ -1082,6 +1153,7 @@ impl eframe::App for InstallerApp {
                     let selected_repo_name = REPO_OPTIONS[self.selected_repo_idx].0;
                     format!("Confirm {} Installation", selected_repo_name)
                 }
+                AppState::SelectingAsset => "Select Download".to_string(),
                 AppState::Complete => "Installation Complete".to_string(),
                 AppState::Ejecting => "Ejecting...".to_string(),
                 AppState::Ejected => "Safe to Remove".to_string(),
@@ -1135,7 +1207,51 @@ impl eframe::App for InstallerApp {
                                         egui::Layout::left_to_right(egui::Align::Center),
                                         |ui| {
                                             if ui.button("Yes, install").clicked() {
-                                                self.start_installation(ctx.clone());
+                                                self.fetch_release(ctx.clone());
+                                            }
+                                        },
+                                    );
+                                });
+                            }
+                            AppState::SelectingAsset => {
+                                ui.add_space(12.0);
+                                ui.label("Multiple files found in this release.");
+                                ui.label("Select the file to install:");
+                                ui.add_space(8.0);
+
+                                let assets = self.available_assets.lock()
+                                    .map(|a| a.clone())
+                                    .unwrap_or_default();
+
+                                for (idx, asset) in assets.iter().enumerate() {
+                                    let size_mb = asset.size as f64 / 1_048_576.0;
+                                    let label = format!("{} ({:.1} MB)", asset.name, size_mb);
+                                    ui.radio_value(&mut self.selected_asset_idx, idx, label);
+                                }
+
+                                ui.add_space(12.0);
+                                ui.separator();
+                                ui.add_space(8.0);
+
+                                ui.columns(2, |columns| {
+                                    columns[0].allocate_ui_with_layout(
+                                        egui::Vec2::ZERO,
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui.button("Cancel").clicked() {
+                                                self.state = AppState::Idle;
+                                            }
+                                        },
+                                    );
+
+                                    columns[1].allocate_ui_with_layout(
+                                        egui::Vec2::ZERO,
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            if ui.button("Install").clicked() {
+                                                if let Some(asset) = assets.get(self.selected_asset_idx).cloned() {
+                                                    self.start_installation(asset, ctx.clone());
+                                                }
                                             }
                                         },
                                     );
@@ -1526,6 +1642,7 @@ impl eframe::App for InstallerApp {
                         let is_busy = matches!(
                             self.state,
                             AppState::FetchingRelease
+                                | AppState::SelectingAsset
                                 | AppState::Downloading
                                 | AppState::Formatting
                                 | AppState::Extracting

@@ -72,12 +72,11 @@ pub async fn get_latest_release(repo_url: &str) -> Result<Release, String> {
         .map_err(|e| format!("Failed to parse release data: {}. The release format may be invalid.", e))
 }
 
-pub fn find_release_asset(release: &Release) -> Option<&Asset> {
-    // Find the largest file with the matching extension
-    // (handles cases where multiple files have the same extension)
+pub fn find_release_assets(release: &Release) -> Vec<Asset> {
     release.assets.iter()
         .filter(|a| a.name.ends_with(ASSET_EXTENSION))
-        .max_by_key(|a| a.size)
+        .cloned()
+        .collect()
 }
 
 pub async fn download_asset(
