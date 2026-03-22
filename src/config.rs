@@ -53,10 +53,14 @@ pub const TEMP_PREFIX: &str = env!("CARGO_PKG_NAME");
 pub const REPO_OPTIONS: &[(&str, &str)] = &[
     ("Stable", "LoveRetro/NextUI"),
     ("Nightly", "LoveRetro/NextUI-nightly"),
+    ("Custom", ""),
 ];
 
 /// Index of the default repository selection (0 = first option)
 pub const DEFAULT_REPO_INDEX: usize = 0;
+
+/// Index of the custom repository selection
+pub const CUSTOM_REPO_INDEX: usize = 2;
 
 /// File extension to look for in GitHub releases (e.g., ".7z", ".zip")
 /// The installer will download the first asset matching this extension

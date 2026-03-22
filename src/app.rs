@@ -1,5 +1,5 @@
 use crate::config::{
-    setup_theme, ASSET_EXTENSION, REPO_OPTIONS, TEMP_PREFIX, VOLUME_LABEL, DEFAULT_REPO_INDEX,
+    setup_theme, ASSET_EXTENSION, REPO_OPTIONS, TEMP_PREFIX, VOLUME_LABEL, DEFAULT_REPO_INDEX, CUSTOM_REPO_INDEX,
 };
 use crate::copy::{copy_directory_with_progress, CopyProgress};
 use crate::drives::{get_removable_drives, DriveInfo};
@@ -46,6 +46,7 @@ pub struct InstallerApp {
     drives: Vec<DriveInfo>,
     selected_drive_idx: Option<usize>,
     selected_repo_idx: usize,
+    custom_repo_url: String,
 
     // Progress tracking
     state: AppState,
@@ -158,6 +159,7 @@ impl InstallerApp {
             drives: Vec::new(),
             selected_drive_idx: None,
             selected_repo_idx: DEFAULT_REPO_INDEX,
+            custom_repo_url: "mohammadsyuhada/nx-redux".to_string(),
             state: AppState::Idle,
             progress: Arc::new(Mutex::new(ProgressInfo {
                 current: 0,
@@ -243,7 +245,11 @@ impl InstallerApp {
         self.installed_drive = Some(drive.clone());
 
         self.state = AppState::FetchingRelease;
-        let (repo_name, repo_url) = REPO_OPTIONS[self.selected_repo_idx];
+        let (repo_name, repo_url) = if self.selected_repo_idx == CUSTOM_REPO_INDEX {
+            ("Custom", self.custom_repo_url.as_str())
+        } else {
+            REPO_OPTIONS[self.selected_repo_idx]
+        };
         self.log(&format!(
             "Starting installation to {} using {}",
             drive.name, repo_name
@@ -1419,6 +1425,18 @@ impl eframe::App for InstallerApp {
                                             self.selected_repo_idx = idx;
                                         }
                                     });
+                                }
+
+                                if self.selected_repo_idx == CUSTOM_REPO_INDEX {
+                                    ui.add_space(8.0);
+                                    let url_field = ui.add(
+                                        egui::TextEdit::singleline(&mut self.custom_repo_url)
+                                            .hint_text("Enter owner/repo")
+                                            .desired_width(150.0),
+                                    );
+                                    if url_field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                        // Optional: handle enter press if needed
+                                    }
                                 }
                             });
                         },
